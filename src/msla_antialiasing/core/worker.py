@@ -20,13 +20,13 @@ class ProcessingWorker(QObject):
 
     def run(self):
         """
-        Starts the processing pipeline.
+        Starts the memory-efficient processing pipeline.
         """
         try:
             p = self.params
-            slice_data = p['slice_data']
-            output_folder = p['output_folder']
             slice_files = p['slice_files']
+            slice_dims = p['slice_dims']
+            output_folder = p['output_folder']
             voxel_dims = p['voxel_dims']
             window_params = p['window_params']
             solver_params = p['solver_params']
@@ -35,28 +35,30 @@ class ProcessingWorker(QObject):
             self.log_message.emit("Processing thread started.")
             os.makedirs(output_folder, exist_ok=True)
 
-            input_shape = slice_data.shape
-            result_volume = np.zeros(input_shape, dtype=np.uint8)
-            binary_input = (slice_data > 127).astype(np.uint8)
-            total_slices = input_shape[0]
+            total_slices, h, w = slice_dims
+            result_volume = np.zeros(slice_dims, dtype=np.uint8)
 
             self.progress_updated.emit(0)
 
-            window_gen = sliding_window(binary_input, **window_params)
+            # The generator now loads data on the fly
+            window_gen = sliding_window(slice_files, slice_dims, **window_params)
 
             for window_data, save_start, save_end, output_start_slice in window_gen:
                 self.log_message.emit(f"Processing window starting at slice {output_start_slice}...")
 
+                # Convert the just-in-time loaded window data to binary
+                binary_window = (window_data > 127).astype(np.uint8)
+
                 if solver_params['backend'] == 'CPU':
                     processed_window = solve_poisson_cpu(
-                        window_data,
+                        binary_window,
                         voxel_size=voxel_dims,
                         precision=solver_params['precision'],
                         matrix_free=solver_params['matrix_free']
                     )
                 else: # GPU
                     processed_window = solve_poisson_gpu(
-                        window_data,
+                        binary_window,
                         voxel_size=voxel_dims,
                         precision=solver_params['precision'],
                         matrix_free=solver_params['matrix_free']

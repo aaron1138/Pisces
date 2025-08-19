@@ -1,62 +1,68 @@
 import numpy as np
+import imageio.v2 as imageio
 
-def sliding_window(data: np.ndarray, window_size: int, solved_layers: int, overlap: int):
+def _load_image_range(files, start, end, dims):
+    """Loads a range of image files into a numpy array."""
+    num_slices, h, w = dims
+    file_list = files[start:end]
+
+    # Pre-allocate numpy array for the window
+    window_data = np.zeros((len(file_list), h, w), dtype=np.uint8)
+
+    for i, f in enumerate(file_list):
+        img = imageio.imread(f)
+        if img.ndim == 3: # Convert to grayscale if it's RGB
+            img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+        window_data[i] = img
+
+    return window_data
+
+def sliding_window(slice_files: list, slice_dims: tuple, window_size: int, solved_layers: int, overlap: int):
     """
-    Generator for a sliding window over a 3D data volume.
+    Generator for a sliding window that loads data from files on the fly.
 
     Args:
-        data (np.ndarray): The 3D numpy array (slices, height, width).
+        slice_files (list): A list of paths to the image files.
+        slice_dims (tuple): A tuple of (num_slices, height, width).
         window_size (int): The total number of slices in each window.
         solved_layers (int): The number of layers to consider "solved" from the center of the window.
         overlap (int): The number of layers to overlap between consecutive windows.
 
     Yields:
         tuple: A tuple containing (window_data, save_start_index, save_end_index, output_start_slice).
-               - window_data (np.ndarray): The chunk of data for the current window.
-               - save_start_index (int): The starting index within the window of the part to be saved.
-               - save_end_index (int): The ending index within the window of the part to be saved.
-               - output_start_slice (int): The starting slice index in the final output volume.
     """
-    num_slices = data.shape[0]
+    num_slices, h, w = slice_dims
 
     if solved_layers > window_size:
         raise ValueError("solved_layers cannot be greater than window_size.")
 
-    # The step size is how many layers we advance in each iteration.
-    # This is typically the number of solved layers.
     step_size = window_size - overlap
 
     current_slice = 0
     output_slice_idx = 0
 
     while current_slice < num_slices:
-        # Define the window boundaries
         start = current_slice
         end = start + window_size
 
-        # Clamp the window to the data boundaries
         if end > num_slices:
             end = num_slices
             start = max(0, end - window_size)
 
-        window_data = data[start:end, :, :]
+        # Load only the required data for this window
+        window_data = _load_image_range(slice_files, start, end, slice_dims)
         actual_window_size = window_data.shape[0]
 
-        # Determine the "solved" region to be saved from this window
-        # For the first window
         if current_slice == 0:
             save_start = 0
             save_end = step_size
-        # For the last window
         elif end == num_slices:
             save_start = overlap
             save_end = actual_window_size
-        # For intermediate windows
         else:
             save_start = overlap
             save_end = overlap + step_size
 
-        # Ensure save indices are within the actual window bounds
         save_start = min(save_start, actual_window_size)
         save_end = min(save_end, actual_window_size)
 

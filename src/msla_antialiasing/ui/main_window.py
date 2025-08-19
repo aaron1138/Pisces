@@ -26,7 +26,7 @@ class MainWindow(QMainWindow):
 
         # --- Data Storage ---
         self.slice_files = []
-        self.slice_data = None
+        self.slice_dims = None # Will store (num_slices, height, width)
         self.output_folder = None
         self.lut_data = None
 
@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
             return None
 
     def start_processing(self):
-        if self.slice_data is None:
+        if not self.slice_files:
             self.log_message("Error: No slice data loaded.")
             return
         if self.output_folder is None:
@@ -204,13 +204,13 @@ class MainWindow(QMainWindow):
         # --- Prepare for threading ---
         self.btn_start.setEnabled(False)
         self.log_message("Preparing processing thread...")
-        self.progress_bar.setRange(0, self.slice_data.shape[0])
+        self.progress_bar.setRange(0, self.slice_dims[0])
         self.progress_bar.setValue(0)
 
         params = {
-            'slice_data': self.slice_data,
-            'output_folder': self.output_folder,
             'slice_files': self.slice_files,
+            'slice_dims': self.slice_dims,
+            'output_folder': self.output_folder,
             'voxel_dims': voxel_dims,
             'window_params': self.get_window_params(),
             'solver_params': self.get_solver_params(),
@@ -305,7 +305,7 @@ class MainWindow(QMainWindow):
         if not folder:
             return
 
-        self.log_message(f"Loading slices from: {folder}")
+        self.log_message(f"Scanning slices from: {folder}")
         supported_formats = ["*.png", "*.bmp", "*.jpg", "*.jpeg", "*.tif", "*.tiff"]
 
         found_files = []
@@ -314,38 +314,30 @@ class MainWindow(QMainWindow):
 
         if not found_files:
             self.log_message("Error: No supported image files found in the selected folder.")
+            self.slice_files = []
+            self.slice_dims = None
             return
 
         self.slice_files = sorted(found_files)
-        self.log_message(f"Found {len(self.slice_files)} image files.")
+        num_slices = len(self.slice_files)
+        self.log_message(f"Found {num_slices} image files. Reading dimensions...")
 
         try:
-            # Read the first image to get dimensions
+            # Read only the first image to get dimensions
             first_image = imageio.imread(self.slice_files[0])
             if first_image.ndim == 3: # Convert to grayscale if it's RGB
                 first_image = np.dot(first_image[...,:3], [0.2989, 0.5870, 0.1140])
 
             h, w = first_image.shape
-            num_slices = len(self.slice_files)
-
-            # Pre-allocate numpy array
-            self.slice_data = np.zeros((num_slices, h, w), dtype=np.uint8)
-            self.slice_data[0] = first_image
-
-            # Load the rest of the images
-            for i, f in enumerate(self.slice_files[1:]):
-                img = imageio.imread(f)
-                if img.ndim == 3:
-                    img = np.dot(img[...,:3], [0.2989, 0.5870, 0.1140])
-                self.slice_data[i+1] = img
+            self.slice_dims = (num_slices, h, w)
 
             self.lbl_slice_info.setText(f"Loaded: {num_slices} slices ({w}x{h})")
-            self.log_message("Successfully loaded all slices into memory.")
+            self.log_message("Slice dimensions confirmed. Ready for processing.")
 
         except Exception as e:
-            self.log_message(f"Error loading slices: {e}")
-            self.slice_data = None
+            self.log_message(f"Error reading slice dimensions: {e}")
             self.slice_files = []
+            self.slice_dims = None
 
 
 if __name__ == '__main__':

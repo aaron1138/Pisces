@@ -1,35 +1,35 @@
 import numpy as np
 import scipy.ndimage as ndi
-from scipy.sparse import spdiags, lil_matrix, csc_matrix
+from scipy.sparse import spdiags, csc_matrix
 import pyamg
 import cupy as cp
 
-def assemble_laplacian_3d(dims, voxel_size):
-    """Assembles the 3D Laplacian operator as a sparse matrix."""
+def assemble_laplacian_3d(dims, voxel_size, float_type=np.float64):
+    """Assembles the 3D Laplacian operator as a sparse matrix with a specific float type."""
     nz, ny, nx = dims
     n = nz * ny * nx
 
     vx, vy, vz = voxel_size
-    dx2, dy2, dz2 = vx*vx, vy*vy, vz*vz
+    dx2, dy2, dz2 = float_type(vx*vx), float_type(vy*vy), float_type(vz*vz)
 
     # Coefficients for the 7-point stencil
-    c_center = 2/dx2 + 2/dy2 + 2/dz2
-    c_x = -1/dx2
-    c_y = -1/dy2
-    c_z = -1/dz2
+    c_center = float_type(2/dx2 + 2/dy2 + 2/dz2)
+    c_x = float_type(-1/dx2)
+    c_y = float_type(-1/dy2)
+    c_z = float_type(-1/dz2)
 
     # Create diagonals
-    diagonals = [c_center * np.ones(n),
-                 c_x * np.ones(n-1), c_x * np.ones(n-1),
-                 c_y * np.ones(n-nx), c_y * np.ones(n-nx),
-                 c_z * np.ones(n-nx*ny), c_z * np.ones(n-nx*ny)]
+    diagonals = [c_center * np.ones(n, dtype=float_type),
+                 c_x * np.ones(n-1, dtype=float_type), c_x * np.ones(n-1, dtype=float_type),
+                 c_y * np.ones(n-nx, dtype=float_type), c_y * np.ones(n-nx, dtype=float_type),
+                 c_z * np.ones(n-nx*ny, dtype=float_type), c_z * np.ones(n-nx*ny, dtype=float_type)]
 
     offsets = [0, -1, 1, -nx, nx, -nx*ny, nx*ny]
 
     A = spdiags(diagonals, offsets, n, n, format='lil')
+    A = A.astype(float_type) # Ensure matrix is of the correct type
 
     # Correct boundary conditions for finite differences
-    # These corrections remove connections that wrap around the volume edges
     for i in range(n):
         if i % nx == 0: # Left face
             if i > 0: A[i, i-1] = 0
@@ -47,17 +47,20 @@ def solve_poisson_cpu(binary_volume, voxel_size, precision='32-bit Float', matri
     float_type = np.float32 if precision == '32-bit Float' else np.float16
 
     # --- 1. Calculate Guidance Vector Field ---
-    distance = ndi.distance_transform_edt(binary_volume) - ndi.distance_transform_edt(1 - binary_volume)
-    grad_z, grad_y, grad_x = np.gradient(distance, voxel_size[2], voxel_size[1], voxel_size[0])
+    # Explicitly set the dtype for distance transforms
+    distance = (ndi.distance_transform_edt(binary_volume, sampling=voxel_size) -
+                ndi.distance_transform_edt(1 - binary_volume, sampling=voxel_size)).astype(float_type)
 
-    norm = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+    grad_z, grad_y, grad_x = np.gradient(distance) # Voxel size is already in the distance
+
+    norm = np.sqrt(grad_x**2 + grad_y**2 + grad_z**2).astype(float_type)
     norm[norm == 0] = 1
-    g_x, g_y, g_z = grad_x/norm, grad_y/norm, grad_z/norm
+    g_x, g_y, g_z = (grad_x/norm).astype(float_type), (grad_y/norm).astype(float_type), (grad_z/norm).astype(float_type)
 
     # --- 2. Compute Divergence of the Guidance Field (RHS) ---
-    div_g = np.gradient(g_z, axis=0) / voxel_size[2] + \
-            np.gradient(g_y, axis=1) / voxel_size[1] + \
-            np.gradient(g_x, axis=2) / voxel_size[0]
+    div_g = (np.gradient(g_z, axis=0) / voxel_size[2] +
+             np.gradient(g_y, axis=1) / voxel_size[1] +
+             np.gradient(g_x, axis=2) / voxel_size[0]).astype(float_type)
 
     u = binary_volume.astype(float_type)
     boundary_mask = (binary_volume == 0) | (binary_volume == 1)
@@ -67,15 +70,15 @@ def solve_poisson_cpu(binary_volume, voxel_size, precision='32-bit Float', matri
         dims = binary_volume.shape
         n = np.prod(dims)
 
-        A = assemble_laplacian_3d(dims, voxel_size)
-        b = -div_g.flatten().astype(float_type)
+        A = assemble_laplacian_3d(dims, voxel_size, float_type=float_type)
+        b = -div_g.flatten()
 
         # Apply Dirichlet boundary conditions
         boundary_indices = np.where(boundary_mask.flatten())[0]
 
         # Adjust RHS for known boundary values
         for i in boundary_indices:
-            b -= A[:, i] * u.flatten()[i]
+            b -= A.getrow(i).dot(u.flatten())[0]
 
         A = A.tolil()
         for i in boundary_indices:
@@ -86,15 +89,15 @@ def solve_poisson_cpu(binary_volume, voxel_size, precision='32-bit Float', matri
         b[boundary_indices] = u.flatten()[boundary_indices]
 
         # Solve the system
-        u_flat = pyamg.solve(A, b, verb=False, tol=1e-5)
+        u_flat = pyamg.solve(A, b, verb=False, tol=1e-4)
         u = u_flat.reshape(dims)
 
     else:
         # --- 3b. Matrix-free Jacobi Iteration (Vectorized) ---
         vx, vy, vz = voxel_size
-        dx2, dy2, dz2 = vx*vx, vy*vy, vz*vz
+        dx2, dy2, dz2 = float_type(vx*vx), float_type(vy*vy), float_type(vz*vz)
 
-        c_center_inv = 1.0 / (2/dx2 + 2/dy2 + 2/dz2)
+        c_center_inv = float_type(1.0 / (2/dx2 + 2/dy2 + 2/dz2))
 
         for _ in range(num_iter):
             u_old = u.copy()
@@ -103,15 +106,13 @@ def solve_poisson_cpu(binary_volume, voxel_size, precision='32-bit Float', matri
             term_y = (u_old[:, :-2, :] + u_old[:, 2:, :]) / dy2
             term_z = (u_old[:-2, :, :] + u_old[2:, :, :]) / dz2
 
-            # Pad to maintain original shape
-            laplacian_u = np.zeros_like(u)
+            laplacian_u = np.zeros_like(u, dtype=float_type)
             laplacian_u[:, :, 1:-1] += term_x
             laplacian_u[:, 1:-1, :] += term_y
             laplacian_u[1:-1, :, :] += term_z
 
             new_u = (laplacian_u - div_g) * c_center_inv
 
-            # Update only interior points
             u[~boundary_mask] = new_u[~boundary_mask]
 
     # --- 4. Finalize ---
@@ -121,38 +122,38 @@ def solve_poisson_cpu(binary_volume, voxel_size, precision='32-bit Float', matri
 def solve_poisson_gpu(binary_volume, voxel_size, precision='32-bit Float', matrix_free=False, num_iter=100):
     """
     Solves the Poisson equation for anti-aliasing on the GPU using CuPy.
-    This implementation uses a vectorized Jacobi iteration.
     """
-    float_type = cp.float32 if precision == '32-bit Float' else cp.float16
+    cupy_float_type = cp.float32 if precision == '32-bit Float' else cp.float16
+    numpy_float_type = np.float32 if precision == '32-bit Float' else np.float16
 
-    # --- 0. Move data to GPU ---
+    # --- 0. Data Preparation on CPU ---
+    # Perform CPU-bound tasks first with correct precision
+    distance_cpu = (ndi.distance_transform_edt(binary_volume, sampling=voxel_size) -
+                    ndi.distance_transform_edt(1 - binary_volume, sampling=voxel_size)).astype(numpy_float_type)
+
+    # --- 1. Move data to GPU and Calculate Guidance Field ---
+    distance = cp.asarray(distance_cpu)
     binary_volume_gpu = cp.asarray(binary_volume)
 
-    # --- 1. Calculate Guidance Vector Field ---
-    # Note: CuPy does not have a direct equivalent of ndi.distance_transform_edt.
-    # We can use the CPU version and move the result to the GPU.
-    distance_cpu = ndi.distance_transform_edt(binary_volume) - ndi.distance_transform_edt(1 - binary_volume)
-    distance = cp.asarray(distance_cpu)
+    grad_z, grad_y, grad_x = cp.gradient(distance)
 
-    grad_z, grad_y, grad_x = cp.gradient(distance, voxel_size[2], voxel_size[1], voxel_size[0])
-
-    norm = cp.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+    norm = cp.sqrt(grad_x**2 + grad_y**2 + grad_z**2).astype(cupy_float_type)
     norm[norm == 0] = 1
-    g_x, g_y, g_z = grad_x/norm, grad_y/norm, grad_z/norm
+    g_x, g_y, g_z = (grad_x/norm).astype(cupy_float_type), (grad_y/norm).astype(cupy_float_type), (grad_z/norm).astype(cupy_float_type)
 
     # --- 2. Compute Divergence of the Guidance Field (RHS) ---
-    div_g = cp.gradient(g_z, axis=0) / voxel_size[2] + \
-            cp.gradient(g_y, axis=1) / voxel_size[1] + \
-            cp.gradient(g_x, axis=2) / voxel_size[0]
+    div_g = (cp.gradient(g_z, axis=0) / voxel_size[2] +
+             cp.gradient(g_y, axis=1) / voxel_size[1] +
+             cp.gradient(g_x, axis=2) / voxel_size[0]).astype(cupy_float_type)
 
-    u = binary_volume_gpu.astype(float_type)
+    u = binary_volume_gpu.astype(cupy_float_type)
     boundary_mask = (binary_volume_gpu == 0) | (binary_volume_gpu == 1)
 
     # --- 3. Matrix-free Jacobi Iteration (Vectorized on GPU) ---
     vx, vy, vz = voxel_size
-    dx2, dy2, dz2 = vx*vx, vy*vy, vz*vz
+    dx2, dy2, dz2 = cupy_float_type(vx*vx), cupy_float_type(vy*vy), cupy_float_type(vz*vz)
 
-    c_center_inv = 1.0 / (2/dx2 + 2/dy2 + 2/dz2)
+    c_center_inv = cupy_float_type(1.0 / (2/dx2 + 2/dy2 + 2/dz2))
 
     for _ in range(num_iter):
         u_old = u.copy()
@@ -161,7 +162,7 @@ def solve_poisson_gpu(binary_volume, voxel_size, precision='32-bit Float', matri
         term_y = (u_old[:, :-2, :] + u_old[:, 2:, :]) / dy2
         term_z = (u_old[:-2, :, :] + u_old[2:, :, :]) / dz2
 
-        laplacian_u = cp.zeros_like(u)
+        laplacian_u = cp.zeros_like(u, dtype=cupy_float_type)
         laplacian_u[:, :, 1:-1] += term_x
         laplacian_u[:, 1:-1, :] += term_y
         laplacian_u[1:-1, :, :] += term_z
