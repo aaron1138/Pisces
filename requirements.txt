@@ -1,0 +1,8 @@
+PySide6
+numpy
+Pillow
+imageio
+scipy
+pyamg
+cupy-cuda11x
+matplotlib
